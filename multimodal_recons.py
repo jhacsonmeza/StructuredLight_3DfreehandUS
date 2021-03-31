@@ -23,7 +23,7 @@ mask_sl = os.path.join(root1,'mask.png')
 
 # Input images for freehand ultrasound reconstruction
 imlist_us = utils.natsort(glob.glob(os.path.join(root2,'US','*')))
-masks_us = utils.natsort(glob.glob(os.path.join(root2,'masks','*')))
+masks_us = utils.natsort(glob.glob(os.path.join(root2,'USmasks','*')))
 
 
 # Load camera-projector stereo calibration parameters
