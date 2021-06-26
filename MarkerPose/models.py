@@ -2,7 +2,7 @@ import cv2
 import torch
 import numpy as np
 
-from marker import utils
+from MarkerPose import utils
 
 
 class DoubleConv(torch.nn.Module):
@@ -104,141 +104,97 @@ class EllipSegNet(torch.nn.Module):
         return x
 
 
-class Detector(torch.nn.Module):
-    def __init__(self, detect, ellipseg, imresize, crop_sz):
-        super(Detector, self).__init__()
-        self.detect = detect
-        self.ellipseg = ellipseg
+class MarkerPose(torch.nn.Module):
+    def __init__(self, superpoint, ellipsegnet, imresize, crop_sz, Params):
+        super(MarkerPose, self).__init__()
+        self.superpoint = superpoint
+        self.ellipsegnet = ellipsegnet
 
         self.imresize = imresize
 
         self.crop_sz = crop_sz
         self.mid = (crop_sz-1)//2
+
+        # Calibration parameters
+        self.K1 = Params['K1']
+        self.K2 = Params['K2']
+        self.dist1 = Params['dist1']
+        self.dist2 = Params['dist2']
+
+        # Create projection matrices of camera 1 and camera 2
+        self.P1 = self.K1 @ np.c_[np.eye(3), np.zeros(3)]
+        self.P2 = self.K2 @ np.c_[Params['R'], Params['t']]
     
     def pixelPoints(self, out_det, out_cls):
         scores = utils.labels2scores(out_det)
         scores = utils.simple_nms(scores, 4)
-        scores = scores[0]
+        out_cls = out_cls.argmax(1)
 
-        # Extract keypoints
-        keypoints = torch.nonzero(scores > 0.015, as_tuple=False) #(n,2) with rows,cols
-        scores = scores[tuple(keypoints.t())] #(n,1)
+        kp1 = utils.sortedPoints(scores[0], out_cls[0])
+        kp2 = utils.sortedPoints(scores[1], out_cls[1])
 
-        # Keep the 3 keypoints with highest score
-        if keypoints.shape[0] > 3:
-            scores, indices = torch.topk(scores, 3, dim=0)
-            keypoints = keypoints[indices]
+        return kp1, kp2
 
-        # Class id
-        out_cls = out_cls.argmax(1).squeeze(0)
-        r,c = (keypoints//8).T
-        id_class = out_cls[r,c]
-
-        if torch.any(id_class == 3):
-            id_class[id_class == 3] = 6-id_class.sum()
-
-        # Sort keypoints
-        keypoints = keypoints[torch.argsort(id_class)].cpu().numpy()
-
-        # from (row,col) to (x,y)
-        keypoints = np.fliplr(keypoints)
-
-        # Using Shoelace formula to know orientation of point
-        A = keypoints[1,0]*keypoints[2,1]-keypoints[2,0]*keypoints[1,1] - \
-            keypoints[0,0]*keypoints[2,1]+keypoints[2,0]*keypoints[0,1] + \
-            keypoints[0,0]*keypoints[1,1]-keypoints[1,0]*keypoints[0,1]
-        
-        if A > 0:
-            keypoints = keypoints[[1,0,2]]
-
-        return keypoints
-    
-    def patches(self, im, keypoints):
-        # Estimate top-left point
-        tl = np.int32(np.round(keypoints)) - self.mid
-
-        # Create patches
-        crops = []
-        for i in range(3):
-            imcrop = im[tl[i,1]:tl[i,1]+self.crop_sz, tl[i,0]:tl[i,0]+self.crop_sz]
-            if imcrop.shape != (self.crop_sz,self.crop_sz):
-                inter_wh = np.minimum(im.shape[::-1],tl[i]+self.crop_sz)-np.maximum(0,tl[i])
-
-                cx = self.crop_sz - inter_wh[0]
-                cy = self.crop_sz - inter_wh[1]
-                if cx != 0: cx += 1
-                if cy != 0: cy += 1
-
-                if (keypoints[i,0]+cx+self.mid > im.shape[1]-1) | (keypoints[i,0]+cx-self.mid < 0): cx = -cx
-                if (keypoints[i,1]+cy+self.mid > im.shape[0]-1) | (keypoints[i,1]+cy-self.mid < 0): cy = -cy
-
-                # Transform image
-                Ht = np.array([[1.,0.,cx],[0.,1.,cy]])
-                im2 = cv2.warpAffine(im.copy(),Ht,None,None,cv2.INTER_LINEAR,cv2.BORDER_REPLICATE)
-
-                # Modify tl corner
-                c = keypoints[i].copy()
-                c[0] += cx
-                c[1] += cy
-                tl2 = np.int32(np.round(c)) - self.mid
-
-                # Crop
-                imcrop = im2[tl2[1]:tl2[1]+self.crop_sz, tl2[0]:tl2[0]+self.crop_sz]
-            
-            crops.append(imcrop)
-        
-        crops = np.dstack(crops)
-
-        return crops
-
-    def forward(self, x):
+    def forward(self, x1, x2):
         device = next(self.parameters()).device
 
-        # --------------------------------------------------- Rough 2D point detection
-        # Convert image to gray and resize
-        imr = cv2.resize(x, self.imresize)
+        # --------------------------------------------------- Pixel-level detection - SuperPoint
+        # Convert image to grayscale if needed
+        if x1.ndim == 3 and x2.ndim == 3:
+            x1 = cv2.cvtColor(x1, cv2.COLOR_BGR2GRAY)
+            x2 = cv2.cvtColor(x2, cv2.COLOR_BGR2GRAY)
+        
+        # Resize and stack
+        imr1 = cv2.resize(x1, self.imresize) # 320x240
+        imr2 = cv2.resize(x2, self.imresize) # 320x240
+        imr = np.stack([imr1, imr2], 0) # 2x320x240
 
-        # Convert image to tensor
-        imt = torch.from_numpy(np.float32(imr/255)).unsqueeze(0).unsqueeze(0)
+        # Convert images to tensor
+        imt = torch.from_numpy(np.float32(imr/255)).unsqueeze(1) #2x1x320x240
         imt = imt.to(device)
 
         # Pixel point estimation
-        out_det, out_cls = self.detect(imt)
-        keypoints = self.pixelPoints(out_det, out_cls)
+        out_det, out_cls = self.superpoint(imt)
+        kp1, kp2 = self.pixelPoints(out_det, out_cls)
+        if kp1.shape[0] < 3 or kp2.shape[0] < 3: return None, None
 
         # Scale points to full resolution
-        keypoints = keypoints/np.array(imr.shape[::-1])*np.array(x.shape[::-1])
+        s = np.array(x1.shape[::-1])/self.imresize
+        kp1 = s*kp1
+        kp2 = s*kp2
 
 
 
-        # --------------------------------------------------- Ellipse segmetnation and sub-pixel center estimation
-        crops = self.patches(x, keypoints)
+        # --------------------------------------------------- Ellipse segmetnation and sub-pixel center estimation - EllipSegNet
+        patches = utils.extractPatches(x1, x2, kp1, kp2, self.crop_sz, self.mid)
 
         # Convert to tensor
-        cropst = torch.from_numpy(np.float32(crops/255))
-        cropst = cropst.permute(2,0,1).unsqueeze(1).to(device)
+        patchest = torch.from_numpy(np.float32(patches/255)).unsqueeze(1) # 2x1x120x120
+        patchest = patchest.to(device)
 
         # Ellipse contour estimation
-        out = torch.sigmoid(self.ellipseg(cropst))
+        out = torch.sigmoid(self.ellipsegnet(patchest))
         out = out.squeeze(1).detach().cpu().numpy()
         out = np.uint8(255*(out>0.5))
-        
-        # Ellipse center estimation
-        centers = []
-        for mask in out:
-            contours,_ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
-            idx = 0
-            if len(contours) > 1:
-                areas = []
-                for cnt in contours:
-                    area = cv2.contourArea(cnt)
-                    areas.append(area)
-                idx = np.argmax(areas).item()
-            
-            rbox = cv2.fitEllipse(contours[idx])
-            centers.append([rbox[0][0],rbox[0][1]])
+        # Ellipse fitting and sub-pixel centers estimation
+        centers = utils.ellipseFitting(out)
+        c1 = centers[:3] + np.int32(np.round(kp1)) - self.mid
+        c2 = centers[3:] + np.int32(np.round(kp2)) - self.mid
 
-        centers = centers + np.int32(np.round(keypoints)) - self.mid
 
-        return centers
+
+        # --------------------------------------------------- Stereo pose estimation
+        # Undistort 2D center coordinates in each image
+        c1 = cv2.undistortPoints(c1.reshape(-1,1,2), self.K1, self.dist1, None, None, self.K1)
+        c2 = cv2.undistortPoints(c2.reshape(-1,1,2), self.K2, self.dist2, None, None, self.K2)
+
+        # Estimate 3D coordinates of centers through triangulation
+        X = cv2.triangulatePoints(self.P1, self.P2, c1, c2)
+        X = X[:3]/X[-1] # Convert from homogeneous to Euclidean
+
+        # Marker pose estimation relative to the left camera/world frame
+        Xo, Xx, Xy = X.T
+        R, t = utils.getPose(Xo, Xx, Xy)
+
+        return R, t
